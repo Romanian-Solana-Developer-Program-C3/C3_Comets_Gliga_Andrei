@@ -1,5 +1,5 @@
 import {Keypair} from "@solana/web3.js";
-import "dontenv/config";
+import "dotenv/config";
 
 const keypair = Keypair.generate();
 

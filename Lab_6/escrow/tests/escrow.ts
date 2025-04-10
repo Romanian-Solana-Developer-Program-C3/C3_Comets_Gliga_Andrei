@@ -1,60 +1,134 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
+import { BN, Program } from "@coral-xyz/anchor";
 import { Escrow } from "../target/types/escrow";
-import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
-import { expect } from "chai";
+import { Connection, Keypair, PublicKey, sendAndConfirmTransaction, SendTransactionError, SystemProgram, Transaction } from "@solana/web3.js";
+import { ASSOCIATED_TOKEN_PROGRAM_ID, createAssociatedTokenAccount, createMint, getAccount, getAssociatedTokenAddress, getAssociatedTokenAddressSync, mintTo, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { assert, expect } from "chai";
+
+const TOKEN_PROGRAM: typeof TOKEN_2022_PROGRAM_ID | typeof TOKEN_PROGRAM_ID = TOKEN_2022_PROGRAM_ID;
 
 describe("escrow", () => {
   // Configure the client to use the local cluster.
-  anchor.setProvider(anchor.AnchorProvider.env());
+  const provider  = anchor.AnchorProvider.env();
+  anchor.setProvider(provider);
 
   const program = anchor.workspace.escrow as Program<Escrow>;
 
-  let offerMaker: Keypair;
-  let offerAccount: Keypair;
+  let maker: Keypair;
+  let tokenA: Keypair;
+  let tokenB: Keypair;
+  let makerAtaTokenA: PublicKey;
+  let vault: PublicKey;
+  let offerPda: PublicKey;
+  let mintA: PublicKey;
+  let mintB: PublicKey;
+  let mintAmount: number;
 
-  beforeEach(async () => {
-    // Initialize keypairs for the offer maker and escrow account
-    offerMaker = Keypair.generate();
-    escrowAccount = Keypair.generate();
+  const accounts: Record<string, PublicKey> = {
+    tokenProgram: TOKEN_PROGRAM_ID,
+    systemProgram: SystemProgram.programId,
+    associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+  };
 
-    // Airdrop SOL to the offer maker for testing
-    const provider = anchor.AnchorProvider.env();
-    const signature = await provider.connection.requestAirdrop(
-      offerMaker.publicKey,
-      anchor.web3.LAMPORTS_PER_SOL
+  const tokenAOfferedAmount = new BN(1000);
+  const tokenBWantedAmount = new BN(1000);
+
+  before(async () => {
+    maker = Keypair.generate();
+
+    const fundAmount = 1e16;
+    const fundTx = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: provider.wallet.publicKey,
+        toPubkey: maker.publicKey,
+        lamports: fundAmount,
+      })
     );
-    await provider.connection.confirmTransaction(signature);
+
+    const txSignature = await sendAndConfirmTransaction(
+      provider.connection,
+      fundTx,
+      [provider.wallet.payer],
+    )
+
+    console.log("Funded maker account with 0.1 SOL:", txSignature);
+
+    mintA = await createMint(
+      provider.connection,
+      provider.wallet.payer,
+      provider.wallet.publicKey,
+      null,
+      4
+    );
+    mintB = await createMint(
+      provider.connection,
+      provider.wallet.payer,
+      provider.wallet.publicKey,
+      null,
+      4
+    );
+
+    console.log("Created mintA: ", mintA.toBase58());
+
+    makerAtaTokenA = await createAssociatedTokenAccount(
+      provider.connection,
+      provider.wallet.payer,
+      mintA,
+      maker.publicKey
+    );
+    console.log("Got the maker AtA for token A: ", makerAtaTokenA)
+    mintAmount = 10000;
+    await mintTo(
+      provider.connection,
+      provider.wallet.payer,
+      mintA,
+      makerAtaTokenA,
+      provider.wallet.publicKey,
+      mintAmount
+    );
+    let makerAtaBalance = await getAccount(provider.connection, makerAtaTokenA);
+    console.log("Maker's token A balance: ", makerAtaBalance.amount.toString());
+
+    accounts.maker = maker.publicKey;
+    accounts.makerTokenAccountA = makerAtaTokenA;
+    accounts.tokenMintA = mintA;
+    accounts.tokenMintB = mintB;
   });
 
   it("Makes an offer successfully", async () => {
-    // Define the parameters for the offer
-    const offerAmount = new anchor.BN(1_000_000); // 1 SOL in lamports
-    const expectedItem = "Item123"; // Example item identifier
+    const offerId = new BN(1234);
 
-    // Call the make_offer instruction
-    await program.methods
-      .make_offer(offerAmount, expectedItem)
-      .accounts({
-        offerMaker: offerMaker.publicKey,
-        escrowAccount: escrowAccount.publicKey,
-        systemProgram: SystemProgram.programId,
-      })
-      .signers([offerMaker, escrowAccount])
+    const offer = PublicKey.findProgramAddressSync(
+      [Buffer.from("offer"), accounts.maker.toBuffer(), offerId.toArrayLike(Buffer, "le", 8)],
+      program.programId
+    )[0];
+
+    const vault = await getAssociatedTokenAddress(accounts.tokenMintA, offer, true, TOKEN_PROGRAM_ID);
+
+    accounts.offer = offer;
+    accounts.vault = vault;
+
+    const txSig = await program.methods
+      .makeOffer(offerId, tokenAOfferedAmount, tokenBWantedAmount)
+      .accounts({ ...accounts })
+      .signers([maker])
       .rpc();
 
-    console.log("Offer made successfully!");
+    const rpcSig = await provider.connection.confirmTransaction(txSig, "confirmed");
+    console.log("Offer transaction signature: ", rpcSig);
 
-    // Fetch the escrow account to verify the state
-    const escrowState = await program.account.escrow.fetch(
-      escrowAccount.publicKey
-    );
-
-    // Assert the state of the escrow account
-    expect(escrowState.offerMaker.toBase58()).equal(
-      offerMaker.publicKey.toBase58()
-    );
-    expect(escrowState.offerAmount.toNumber()).equal(offerAmount.toNumber());
-    expect(escrowState.expectedItem).equal(expectedItem);
+     // Check our vault contains the tokens offered
+     const vaultBalanceResponse = await provider.connection.getTokenAccountBalance(vault);
+     const vaultBalance = new BN(vaultBalanceResponse.value.amount);
+     assert(vaultBalance.eq(tokenAOfferedAmount));
+ 
+     // Check our Offer account contains the correct data
+     const offerAccount = await program.account.offer.fetch(offer);
+ 
+     assert(offerAccount.maker.equals(maker.publicKey));
+     assert(offerAccount.tokenMintA.equals(accounts.tokenMintA));
+     assert(offerAccount.tokenMintB.equals(accounts.tokenMintB));
+     assert(offerAccount.tokenBWantedAmount.eq(tokenBWantedAmount));
   });
+    
 });

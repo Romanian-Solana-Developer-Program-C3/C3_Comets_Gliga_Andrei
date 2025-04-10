@@ -1,72 +1,91 @@
 //This instructions will make an offer as an escrow account
 use anchor_lang::prelude::*;
 use anchor_spl::{
-    token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked},
-    associated_token::AssociatedToken
+    associated_token::AssociatedToken,
+    token::{transfer_checked, Mint, Token, TokenAccount, TransferChecked}
 };
-use crate::state::Offer;
+use crate::{Offer, ANCHOR_DISCRIMINATOR};
 
 #[derive(Accounts)]
-#[instruction(maker_amount: u64)]
+#[instruction(id: u64)]
 pub struct MakeOffer<'info> {
     #[account(mut)]
     pub maker: Signer<'info>,
 
-    pub token_a_mint: Account<'info, Mint>,
-    pub token_b_mint: Account<'info, Mint>,
+    #[account(mint::token_program=token_program)]
+    pub token_mint_a: Account<'info, Mint>,
+
+    #[account(mint::token_program=token_program)]
+    pub token_mint_b: Account<'info, Mint>,
 
     #[account(
         mut,
-        constraint = ata.amount >= maker_amount,
-        associated_token::mint = token_a_mint,
+        associated_token::mint = token_mint_a,
         associated_token::authority = maker,
+        associated_token::token_program = token_program,
     )]
-    pub ata: Account<'info, TokenAccount>,
+    pub maker_token_account_a: Account<'info, TokenAccount>,
 
     #[account(
-        init_if_needed,
+        init,
         payer = maker,
-        associated_token::mint = token_a_mint,
-        associated_token::authority = offer,
-    )]
-    pub vault: Account<'info, TokenAccount>,
-
-    #[account(
-        init_if_needed,
-        payer = maker,
-        space = Offer::INIT_SPACE,
-        seeds = [b"offer", maker.key().as_ref(), token_a_mint.key().as_ref(), token_b_mint.key().as_ref()],
+        space = ANCHOR_DISCRIMINATOR + Offer::INIT_SPACE,
+        seeds = [b"offer", maker.key().as_ref(), id.to_le_bytes().as_ref()],
         bump,
     )]
     pub offer: Account<'info, Offer>,
+
+    #[account(
+        init,
+        payer = maker,
+        associated_token::mint = token_mint_a,
+        associated_token::authority = offer,
+        associated_token::token_program = token_program,
+    )]
+    pub vault: Account<'info, TokenAccount>,
+
+    
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
     pub associated_token_program: Program<'info, AssociatedToken>,
 
 }
 
-pub fn handler(ctx: Context<MakeOffer>, token_a_amount: u64, token_b_amount: u64) -> Result<()> {
-    // Create the offer object
-    ctx.accounts.offer.set_inner(
-        Offer {
-            maker: ctx.accounts.maker.key(),
-            mint_a: ctx.accounts.token_a_mint.key(),
-            mint_b: ctx.accounts.token_b_mint.key(),
-            amount_a: token_a_amount,
-            amount_b: token_b_amount,
-        }
-    );
+pub fn save_offer(
+    context: Context<MakeOffer>,
+    id: u64,
+    token_b_wanted_amount: u64,
+) -> Result<()> {
+    context.accounts.offer.set_inner( Offer{
+        id,
+        maker: context.accounts.maker.key(),
+        token_mint_a: context.accounts.token_mint_a.key(),
+        token_mint_b: context.accounts.token_mint_b.key(),
+        token_b_wanted_amount,
+        bump: context.bumps.offer,
+    });
+    Ok(())
+}
 
-    // Transfer funds to vault
-    let cpi_accounts = TransferChecked{
-        from: ctx.accounts.maker.to_account_info(),
-        to: ctx.accounts.vault.to_account_info(),
-        mint: ctx.accounts.token_a_mint.to_account_info(),
-        authority: ctx.accounts.maker.to_account_info().clone(),
+pub fn send_offered_tokens_to_vault(
+    context: &Context<MakeOffer>,
+    token_a_offered_amount: u64,
+) -> Result<()>{
+    let transfer_accounts = TransferChecked{
+        from: context.accounts.maker_token_account_a.to_account_info(),
+        to: context.accounts.vault.to_account_info(),
+        mint: context.accounts.token_mint_a.to_account_info(),
+        authority: context.accounts.maker.to_account_info(),
     };
 
-    let cpi_program = ctx.accounts.token_program.to_account_info();
+    let cpi_context = CpiContext::new(
+        context.accounts.token_program.to_account_info(),
+        transfer_accounts,
+    );
 
-    let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-    transfer_checked(cpi_ctx, token_a_amount, 0)
+    transfer_checked(
+        cpi_context,
+        token_a_offered_amount,
+        context.accounts.token_mint_a.decimals,
+    )
 }
